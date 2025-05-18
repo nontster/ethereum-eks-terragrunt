@@ -39,17 +39,12 @@ output "cluster_certificate_authority_data" {
 }
 
 # Optional: Output the role ARN for easy reference (e.g., for K8s manifests)
-output "s3_sync_iam_role_arn" {
-  description = "ARN of the IAM Role for S3 Sync Service Account"
-  value       = module.iam_assumable_role_s3_sync.iam_role_arn
-}
+# output "s3_sync_iam_role_arn" {
+#   description = "ARN of the IAM Role for S3 Sync Service Account"
+#   value       = module.iam_assumable_role_s3_sync.iam_role_arn
+# }
 
-output "s3_sync_k8s_service_account_name" {
-  description = "Name of the Kubernetes Service Account to create"
-  value       = local.s3_sync_k8s_service_account_name
-}
-
-output "s3_sync_k8s_service_account_namespace" {
-  description = "Namespace of the Kubernetes Service Account to create"
-  value       = local.s3_sync_k8s_service_account_ns
+output "aws_efs_file_system_id" {
+  description = "ID of the EFS file system"
+  value       = aws_efs_file_system.this[0].id
 }

@@ -75,3 +75,15 @@ variable "enable_aws_lbc_role" {
   type        = bool
   default     = false
 }
+
+variable "enable_cloudwatch_observability_addon" {
+  description = "Enable CloudWatch observability addon"
+  type        = bool
+  default     = false
+}
+
+variable "enable_secrets_store_csi_driver_role" {
+  description = "Enable Secrets Store CSI driver role"
+  type        = bool
+  default     = false
+}

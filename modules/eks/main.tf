@@ -30,22 +30,31 @@ locals {
     }
   } : {} # Use an empty map if disabled
 
+  cloudwatch_observability_addon = var.enable_cloudwatch_observability_addon ? {
+    amazon-cloudwatch-observability = {
+      # This reference is safe because it's only evaluated if the condition is true
+      service_account_role_arn = module.aws_cloudwatch_observability_irsa_role[0].iam_role_arn
+    }
+  } : {}
+
   # Merge all addons together
   final_cluster_addons = merge(
     local.base_cluster_addons,
     local.ebs_csi_addon,
-    local.efs_csi_addon
+    local.efs_csi_addon,
+    local.cloudwatch_observability_addon
   )
 
   # --- Configuration for S3 Sync IRSA ---
-  s3_sync_role_name                = "s3-sync-role-${module.eks.cluster_name}" # Or any unique name
-  s3_sync_policy_name_prefix       = "S3SyncPolicy-${module.eks.cluster_name}-"
-  s3_sync_k8s_service_account_name = "s3-sync-sa" # The name of the K8s Service Account you will create
-  s3_sync_k8s_service_account_ns   = "ethereum"   # The K8s namespace where the SA and pod will reside
-  s3_source_bucket_name            = "domecloud-ethereum-config-dev"
-  s3_source_bucket_arn             = "arn:aws:s3:::${local.s3_source_bucket_name}"
-  s3_source_bucket_objects_arn     = "arn:aws:s3:::${local.s3_source_bucket_name}/*"
-
+  s3_access_role_name            = "s3-access-role-${module.eks.cluster_name}" # Or any unique name
+  s3_sync_policy_name_prefix     = "S3SyncPolicy-${module.eks.cluster_name}-"
+  geth_service_account_name      = "geth"      # The name of the K8s Service Account you will create
+  beacon_service_account_name    = "beacon"    # The name of the K8s Service Account you will create
+  validator_service_account_name = "validator" # The name of the K8s Service Account you will create
+  ethereum_service_account_ns    = "ethereum"  # The K8s namespace where the SA and pod will reside
+  s3_source_bucket_name          = "domecloud-ethereum-config-dev"
+  s3_source_bucket_arn           = "arn:aws:s3:::${local.s3_source_bucket_name}"
+  s3_source_bucket_objects_arn   = "arn:aws:s3:::${local.s3_source_bucket_name}/*"
 }
 
 # EKS Cluster Module
@@ -160,6 +169,207 @@ module "aws_lbc_irsa_role" {
 
 }
 
+module "aws_cloudwatch_observability_irsa_role" {
+  count = var.enable_cloudwatch_observability_addon ? 1 : 0
+
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "~> 5.55"
+
+  role_name_prefix                       = "${module.eks.cluster_name}-cw-agent-irsa-"
+  attach_cloudwatch_observability_policy = true
+
+  oidc_providers = {
+    sts = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["kube-system:cloudwatch-agent"]
+    }
+  }
+
+  tags = {
+    Name        = "${module.eks.cluster_name}-cloudwatch-observability-irsa"
+    Environment = var.environment_name
+  }
+}
+
+# --- Secrets Store CSI Driver Provider AWS IRSA ---
+
+# IAM Policy Document granting read access to Secrets Manager
+# This policy is for the CSI Driver AWS Provider DaemonSet/Deployment,
+# which fetches secrets. Application pods will need their OWN IRSA policies
+# to restrict which secrets they are allowed to retrieve.
+data "aws_iam_policy_document" "secrets_manager_csi_policy_doc" {
+  statement {
+    sid    = "AllowSecretsStoreCSIAccess"
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:DescribeSecret",
+      # Include SSM Parameter Store permissions if you plan to use it
+      # "ssm:GetParameter",
+      # "ssm:GetParameters",
+      # "ssm:GetParametersByPath",
+      # "ssm:DescribeParameters"
+    ]
+    # It's common to allow access to all secrets for the provider role,
+    # and use the application pod's IRSA for fine-grained control.
+    # If you need to restrict the provider role itself, change this resource ARN.
+    resources = ["arn:aws:secretsmanager:*:*:secret:*"]
+
+    # If using SSM:
+    # resources = ["arn:aws:ssm:*:*:parameter/*", "arn:aws:secretsmanager:*:*:secret:*"]                    
+  }
+}
+
+# Create the IAM Policy for the Secrets Store CSI Driver AWS Provider
+resource "aws_iam_policy" "secrets_manager_csi_policy" {
+  name_prefix = "${module.eks.cluster_name}-secrets-csi-provider-"
+  description = "Policy allowing Secrets Store CSI Driver AWS Provider to read secrets"
+  policy      = data.aws_iam_policy_document.secrets_manager_csi_policy_doc.json
+}
+
+
+# IAM Roles for Service Accounts (IRSA) for Secrets Store CSI Driver AWS Provider
+# This role is for the DaemonSet/Deployment running the AWS provider component,
+# NOT for your application pods that will consume the secrets.
+module "aws_secrets_manager_csi_irsa_role" {
+  count = var.enable_secrets_store_csi_driver_role ? 1 : 0
+
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "~> 5.30"
+
+  role_name = "${module.eks.cluster_name}-secrets-csi-irsa" # prefer to use exact name
+
+  # Attach the policy created above
+  role_policy_arns = {
+    policy = aws_iam_policy.secrets_manager_csi_policy.arn
+  }
+
+  oidc_providers = {
+    sts = {
+      provider_arn = module.eks.oidc_provider_arn
+      # Standard SA for the Secrets Store CSI Provider for AWS
+      # Check the exact Service Account name used by the Helm chart/addon if different
+      namespace_service_accounts = [
+        "${local.ethereum_service_account_ns}:${local.geth_service_account_name}",
+        "${local.ethereum_service_account_ns}:${local.beacon_service_account_name}",
+        "${local.ethereum_service_account_ns}:${local.validator_service_account_name}",
+      ]
+
+    }
+  }
+
+  tags = {
+    Name        = "${module.eks.cluster_name}-secrets-csi-provider-irsa"
+    Environment = var.environment_name
+  }
+}
+
+#---------------------------------------------------------------
+# EKS Blueprints Addons
+#---------------------------------------------------------------
+module "eks_blueprints_addons" {
+  source  = "aws-ia/eks-blueprints-addons/aws"
+  version = "~> 1.20"
+
+  cluster_name      = module.eks.cluster_name
+  cluster_endpoint  = module.eks.cluster_endpoint
+  cluster_version   = module.eks.cluster_version
+  oidc_provider_arn = module.eks.oidc_provider_arn
+
+  enable_metrics_server = true
+
+  #---------------------------------------
+  # Prommetheus and Grafana stack
+  #---------------------------------------
+  #---------------------------------------------------------------
+  # Install Kafka Monitoring Stack with Prometheus and Grafana
+  # 1- Grafana port-forward `kubectl port-forward svc/kube-prometheus-stack-grafana 8080:80 -n monitoring`
+  # 2- Grafana Admin user: admin
+  # 3- Get admin user password: `aws secretsmanager get-secret-value --secret-id <output.grafana_secret_name> --region $AWS_REGION --query "SecretString" --output text`
+  #--------------------------------------------------------------- 
+  enable_kube_prometheus_stack = true
+
+  kube_prometheus_stack = {
+    name          = "kube-prometheus-stack"
+    chart_version = "72.3.0"
+    repository    = "https://prometheus-community.github.io/helm-charts"
+    namespace     = "monitoring"
+    values = [templatefile("helm-values/kube_prometheus_stack_values.yaml", {
+      enable_kube_controller_manager                     = false
+      enable_kube_etcd                                   = false
+      enable_kube_scheduler                              = false
+      enable_kube_proxy                                  = false
+      enable_rule_etcd                                   = false
+      enable_rule_kubernetes_system                      = false
+      enable_rule_kube_controller_manager                = false
+      enable_rule_kube_scheduler_alerting                = false
+      enable_rule_kube_scheduler_recording               = false
+      enable_grafana_sidecar_dashboards                  = true
+      prom_rule_selector_nil_uses_helm_values            = false
+      prom_service_monitor_selector_nil_uses_helm_values = false
+      prom_pod_monitor_selector_nil_uses_helm_values     = false
+      prom_probe_selector_nil_uses_helm_values           = false
+    })]
+  }
+
+  enable_secrets_store_csi_driver = true
+  secrets_store_csi_driver = {
+    namespace     = "kube-system"
+    chart_version = "1.5.0"
+    set = [
+      {
+        name  = "syncSecret.enabled",
+        value = "true"
+      }
+    ]
+  }
+
+  enable_secrets_store_csi_driver_provider_aws = true
+  secrets_store_csi_driver_provider_aws = {
+    namespace     = "kube-system"
+    chart_version = "1.0.1"
+  }
+
+  #---------------------------------------
+  # AWS for FluentBit - DaemonSet
+  #---------------------------------------
+  #enable_aws_for_fluentbit = true
+  # aws_for_fluentbit_cw_log_group = {
+  #   use_name_prefix   = false
+  #   name              = "/${local.eks_cluster_name}/aws-fluentbit-logs" # Add-on creates this log group
+  #   retention_in_days = 30
+  # }
+  # aws_for_fluentbit = {
+  #   chart_version = "0.1.35"
+  #   s3_bucket_arns = [
+  #     module.s3_bucket.s3_bucket_arn,
+  #     "${module.s3_bucket.s3_bucket_arn}/*"
+  #   ]
+  #   values = [templatefile("${path.module}/helm-values/aws-for-fluentbit-values.yaml", {
+  #     region               = var.aws_region,
+  #     cloudwatch_log_group = "/${local.eks_cluster_name}/aws-fluentbit-logs"
+  #     s3_bucket_name       = module.s3_bucket.s3_bucket_id
+  #     cluster_name         = module.eks.cluster_name
+  #   })]
+  # }
+
+  # enable_aws_load_balancer_controller = true
+  # aws_load_balancer_controller = {
+  #   chart_version = "1.12.0"
+  #   set = [{
+  #     name  = "enableServiceMutatorWebhook"
+  #     value = "false"
+  #   }]
+  # }
+
+  tags = {
+    Name        = "${local.eks_cluster_name}-blueprints-addons"
+    Environment = var.environment_name
+  }
+
+  depends_on = [helm_release.alb_controller]
+}
+
 # resource "null_resource" "wait_for_cluster" {
 #   # Triggers ensure the provisioner re-runs if the cluster endpoint/ID changes.
 #   triggers = {
@@ -240,9 +450,9 @@ resource "kubernetes_storage_class" "gp3" {
   volume_binding_mode    = "WaitForFirstConsumer" # Recommended: Waits until a pod needs the volume
 
   parameters = {
-    type      = "gp3"  
-    fsType    = "ext4"  
-    encrypted = true 
+    type      = "gp3"
+    fsType    = "ext4"
+    encrypted = true
     # You can add throughput/IOPS parameters for gp3 here if needed
     #iops       = 5700
     #throughput = 250
@@ -293,7 +503,7 @@ resource "aws_security_group_rule" "allow_efs_2049" {
 resource "kubernetes_storage_class" "aws-efs-csi-driver" {
   count = var.enable_aws_efs_csi_driver_role ? 1 : 0
   metadata {
-    name = "csi-efs"
+    name = "efs-sc"
     annotations = {
       "storageclass.kubernetes.io/is-default-class" = "false"
     }
@@ -349,34 +559,36 @@ resource "aws_iam_policy" "s3_sync_policy" {
   policy      = data.aws_iam_policy_document.s3_sync_policy_doc.json
 }
 
-module "iam_assumable_role_s3_sync" {
-  source = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
-  # Use a specific version consistent with your project, v5.30.0 is recent as of late 2023/early 2024
-  # Pinning to a specific minor version is generally safer for production
-  version = "~> 5.30" # Or your existing version like "~> v2.6.0" if compatible
+# module "iam_assumable_role_s3_sync" {
+#   source = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+#   # Use a specific version consistent with your project, v5.30.0 is recent as of late 2023/early 2024
+#   # Pinning to a specific minor version is generally safer for production
+#   version = "~> 5.30" # Or your existing version like "~> v2.6.0" if compatible
 
-  create_role = true
-  role_name   = local.s3_sync_role_name
+#   create_role = true
+#   role_name   = local.s3_access_role_name
 
-  # List of IAM policy ARNs to attach to the role
-  role_policy_arns = [
-    aws_iam_policy.s3_sync_policy.arn
-  ]
+#   # List of IAM policy ARNs to attach to the role
+#   role_policy_arns = [
+#     aws_iam_policy.s3_sync_policy.arn
+#   ]
 
-  # OIDC Provider URL from your EKS cluster - remove the "https://" prefix
-  # Ensure module.eks.cluster_oidc_issuer_url provides the correct URL
-  provider_url = replace(module.eks.cluster_oidc_issuer_url, "https://", "")
+#   # OIDC Provider URL from your EKS cluster - remove the "https://" prefix
+#   # Ensure module.eks.cluster_oidc_issuer_url provides the correct URL
+#   provider_url = replace(module.eks.cluster_oidc_issuer_url, "https://", "")
 
-  # Define which Kubernetes Service Account can assume this role
-  oidc_fully_qualified_subjects = [
-    "system:serviceaccount:${local.s3_sync_k8s_service_account_ns}:${local.s3_sync_k8s_service_account_name}"
-  ]
+#   # Define which Kubernetes Service Account can assume this role
+#   oidc_fully_qualified_subjects = [
+#     "system:serviceaccount:${local.ethereum_service_account_ns}:${local.geth_service_account_name}",
+#     "system:serviceaccount:${local.ethereum_service_account_ns}:${local.beacon_service_account_name}",
+#     "system:serviceaccount:${local.ethereum_service_account_ns}:${local.validator_service_account_name}",
+#   ]
 
-  tags = {
-    Name        = local.s3_sync_role_name
-    Environment = var.environment_name
-  }
-}
+#   tags = {
+#     Name        = local.s3_access_role_name
+#     Environment = var.environment_name
+#   }
+# }
 
 resource "helm_release" "alb_controller" {
   namespace = "kube-system"
@@ -384,7 +596,7 @@ resource "helm_release" "alb_controller" {
   name       = "aws-load-balancer-controller"
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
-  version    = "1.12.0"
+  version    = "1.13.0"
 
   set {
     name  = "serviceAccount.create"
@@ -431,3 +643,52 @@ resource "kubernetes_service_account" "aws_lbc_sa" {
     }
   }
 }
+
+
+resource "kubernetes_config_map_v1" "grafana_geth_dashboard_cm" {
+  metadata {
+    name      = "geth"
+    namespace = "monitoring" # Or your kube-prometheus-stack namespace
+    labels = {
+      grafana_dashboard = "1"
+      # You might need other labels depending on your specific chart version or custom configuration.
+      # For example, some configurations might require a label matching the Helm release name.
+      # Check the values.yaml of your kube-prometheus-stack chart for grafana.sidecar.dashboards.label
+    }
+  }
+  data = {
+    "geth-dashboard.json" = templatefile("grafana-dashboards/geth.json", {})
+    # You can add multiple dashboards to the same ConfigMap or create separate ConfigMaps
+    # "another-dashboard.json" = file("${path.module}/dashboards/another-dashboard.json")
+  }
+
+  depends_on = [module.eks_blueprints_addons]
+}
+
+# module "iam_assumable_role_secrets_store_csi_driver" {
+#   source = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+#   version = "~> 5.55" 
+
+#   create_role = true
+#   role_name   = "secrets-store-csi-driver-role"
+
+#   role_policy_arns = [
+#     aws_iam_policy.secrets_manager_csi_policy.arn
+#   ]
+
+#   # OIDC Provider URL from your EKS cluster - remove the "https://" prefix
+#   # Ensure module.eks.cluster_oidc_issuer_url provides the correct URL
+#   provider_url = replace(module.eks.cluster_oidc_issuer_url, "https://", "")
+
+#   # Define which Kubernetes Service Account can assume this role
+#   oidc_fully_qualified_subjects = [
+#     "system:serviceaccount:${local.ethereum_service_account_ns}:${local.geth_service_account_name}",
+#     "system:serviceaccount:${local.ethereum_service_account_ns}:${local.beacon_service_account_name}",
+#     "system:serviceaccount:${local.ethereum_service_account_ns}:${local.validator_service_account_name}",
+#   ]
+
+#   tags = {
+#     #Name        = local.s3_access_role_name
+#     Environment = var.environment_name
+#   }
+# }

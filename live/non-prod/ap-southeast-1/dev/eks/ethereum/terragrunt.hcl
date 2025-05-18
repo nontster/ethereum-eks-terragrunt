@@ -29,9 +29,11 @@ inputs = {
   eks_cluster_version = local.eks_cluster_version
   
   enable_aws_ebs_csi_driver_role = true  # Enable the AWS EBS CSI driver role
-  enable_aws_efs_csi_driver_role = false # Enable the AWS EFS CSI driver role
+  enable_aws_efs_csi_driver_role = true # Enable the AWS EFS CSI driver role
   enable_aws_lbc_role = true  # Enable the AWS Load Balancer Controller role
-
+  enable_cloudwatch_observability_addon = true  # Enable CloudWatch observability addon
+  enable_secrets_store_csi_driver_role = true  # Enable Secrets Store CSI driver role
+  
   node_group_min_size = 2
   node_group_max_size = 5
   instance_types      = ["m6i.large"]  # Specify the desired instance types
